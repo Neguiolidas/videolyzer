@@ -41,7 +41,8 @@ python videolyzer.py ./my-video.mp4 --verify --out report.md
 | Download | None. The URL goes straight to the model (`file_data`) | None for gemini (full upload via Files API); keyframes extracted locally for openai |
 | Temporal understanding | Native: the model samples the timeline itself | Native (gemini) / keyframe-based (openai) |
 | Subtle-motion detection | **Not available** (would require downloading the video) | Available: optical-flow pass flags small-amplitude motion segments and injects them into the prompt as an explicit hint |
-| Speed | Fastest | Slower (upload + optional motion pass) |
+| Cut detection | **Not available** (would require downloading the video) | Available: ffmpeg scene detection finds exact hard-cut timestamps (`--cut-threshold`, default 0.4); they go into the prompt as scene-boundary anchors |
+| Speed | Fastest | Slower (upload + optional motion/cut passes) |
 
 ### URL mode (gemini only)
 
@@ -49,10 +50,15 @@ No download, no frame extraction. The video URL is passed to the model and it do
 
 ### Local file mode
 
-The file is validated with `ffprobe` (codec, duration, integrity — no frames extracted), then:
+The file is validated with `ffprobe` (codec, duration, integrity — no frames extracted), then two deterministic passes run locally before the model sees anything:
 
-- **gemini:** the whole file is uploaded through the Files API; the model samples the timeline itself. Before the upload, an OpenCV pass (Farneback optical flow, 2 fps sampling, 3×3 grid) measures motion magnitude per segment and flags anything above background noise (median + 4·1.4826·MAD, robust to outliers). The flagged timestamps, region and dominant axis go into the prompt as an explicit hint ("do NOT say these segments are static").
-- **openai (any OpenAI-compatible API):** `N` evenly spaced keyframes (`--keyframes`, default 8) are extracted with ffmpeg and sent as images through `/v1/chat/completions` (vision). The same optical-flow pass runs and feeds the same hint section into the prompt. URL input is not supported with this provider.
+- **Cut detection** (ffmpeg scene detection, `--cut-threshold` default 0.4, skip with `--no-cuts`): finds exact hard-cut timestamps. They go into the prompt as scene-boundary anchors ("a new scene starts at each cut timestamp — do NOT merge scenes across a cut"), so the model aligns on measured cuts instead of guessing approximate boundaries.
+- **Subtle-motion pass** (Farneback optical flow, 2 fps sampling, 3×3 grid): measures motion magnitude per segment and flags anything above background noise (median + 4·1.4826·MAD, robust to outliers). The flagged timestamps, region and dominant axis go into the prompt as an explicit hint ("do NOT say these segments are static").
+
+Then:
+
+- **gemini:** the whole file is uploaded through the Files API; the model samples the timeline itself.
+- **openai (any OpenAI-compatible API):** `N` evenly spaced keyframes (`--keyframes`, default 8) are extracted with ffmpeg and sent as images through `/v1/chat/completions` (vision). URL input is not supported with this provider.
 
 ## Auxiliary model & Modo Rapido
 
@@ -94,7 +100,8 @@ videolyzer.py <source> [--provider gemini|openai] [--model NAME]
     [--base-url URL] [--api-key KEY]
     [--aux-model NAME] [--aux-base-url URL] [--aux-api-key KEY]
     [--fast] [--verify]
-    [--out report.md] [--prompt "..."] [--no-motion] [--keyframes 8]
+    [--out report.md] [--prompt "..."] [--no-motion] [--no-cuts]
+    [--cut-threshold 0.4] [--keyframes 8]
 ```
 
 | Flag | Default | Description |
@@ -112,6 +119,8 @@ videolyzer.py <source> [--provider gemini|openai] [--model NAME]
 | `--out` | stdout | Output `.md` file |
 | `--prompt` | built-in | Custom analysis prompt (overrides the default) |
 | `--no-motion` | off | Skip the optical-flow subtle-motion pass |
+| `--cut-threshold` | 0.4 | Scene-detection threshold for deterministic cut detection. Lower = more sensitive |
+| `--no-cuts` | off | Skip deterministic cut detection |
 | `--keyframes` | 8 | Keyframes for the openai provider / aux model |
 
 ## Requirements
