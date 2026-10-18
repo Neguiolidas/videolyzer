@@ -337,7 +337,7 @@ def gemini_upload(base: str, key: str, path: str, mime: str) -> str | None:
     """Direct upload to the Gemini Files API. Returns the file name."""
     with open(path, "rb") as f:
         body = f.read()
-    url = f"{base}/upload/v1beta/files?key={key}"
+    url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={key}"
     data = http_json(url, {"Content-Type": mime}, body, timeout=600)
     if not data:
         return None
