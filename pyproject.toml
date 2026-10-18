@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "videolyzer"
+version = "0.1.0"
+description = "give agents the ability to understand and deep analyze videos"
+readme = "README.md"
+authors = [{name = "Neguiolidas"}]
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+keywords = ["video", "video-analysis", "ai-agents", "multimodal", "gemini"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+]
+
+[project.urls]
+Homepage = "https://github.com/Neguiolidas/videolyzer"
+Repository = "https://github.com/Neguiolidas/videolyzer"
+Issues = "https://github.com/Neguiolidas/videolyzer/issues"
+
+[project.scripts]
+videolyzer = "videolyzer:main"
+
+[tool.setuptools]
+py-modules = ["videolyzer"]
