@@ -4,7 +4,8 @@
 Usage:
     videolyzer.py <youtube-url-or-file> [--provider gemini] [--out report.md]
         [--model gemini-3.1-flash-lite] [--base-url URL] [--api-key KEY]
-        [--prompt "..."] [--no-motion] [--keyframes 8]
+        [--prompt "..."] [--no-motion] [--no-cuts] [--cut-threshold 0.4]
+        [--keyframes 8]
         [--aux-model NAME] [--aux-base-url URL] [--aux-api-key KEY] [--fast]
 
 Providers:
@@ -40,17 +41,22 @@ Modo Rapido (--fast):
 
 Modes:
     URL (http, gemini only): the URL is sent straight to the model
-        (file_data), no download. Fast. No subtle-motion detection
-        (that would require downloading the video).
+        (file_data), no download. Fast. No subtle-motion detection and
+        no cut detection (both would require downloading the video).
     Local file: validated with ffprobe, then analyzed natively.
         With --provider gemini the whole file is uploaded and the model
         does its own temporal sampling (no frame extraction by us).
-        Before upload, an OpenCV pass (Farneback optical flow) flags
-        segments with subtle motion above background noise; the timestamps
-        go into the prompt as an explicit hint (hybrid two-pass).
+        Before upload, two deterministic passes run locally:
+          - cut detection (ffmpeg scene detection, --cut-threshold):
+            exact hard-cut timestamps go into the prompt as anchors so
+            the model aligns scene boundaries on them instead of guessing;
+          - subtle-motion pass (Farneback optical flow): flags segments
+            with small-amplitude motion above background noise; the
+            timestamps go into the prompt as an explicit hint
+            (hybrid two-pass).
         With --provider openai, evenly spaced keyframes are extracted
-        and sent as images; the motion pass still runs and feeds the
-        same hint section into the prompt.
+        and sent as images; both local passes still run and feed the
+        same hint sections into the prompt.
 
 Output: Markdown report with detected scenes (timestamps), transcript
 aligned per scene, key moments, tone/emotion, and temporal verification.
@@ -65,6 +71,7 @@ import base64
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -117,6 +124,16 @@ measurement. Describe EXACTLY what moves in each segment: which object,
 direction, approximate amplitude and rhythm. Do NOT say these segments are
 static. If the motion is ambiguous, describe what the measurement indicates
 without inventing a cause.
+{items}
+"""
+
+CUT_HINT_SECTION = """
+## Detected cuts (deterministic, ffmpeg scene detection)
+The hard cuts below were detected by frame-difference analysis and are
+EXACT, not approximate. Anchor your scene boundaries on these timestamps:
+a new scene starts at each cut timestamp. Do NOT merge scenes across a cut,
+and do NOT invent scene boundaries between cuts unless there is a clear
+visual change (camera angle, location) without a hard cut.
 {items}
 """
 
@@ -305,16 +322,47 @@ def detect_subtle_motion(path: str, sample_fps: float = 2.0) -> list:
     return result
 
 
-def build_prompt(segments: list, base_prompt: str) -> str:
+def build_prompt(segments: list, base_prompt: str, cuts: list | None = None) -> str:
+    prompt = base_prompt
+    if cuts:
+        items = "\n".join(f"- cut at {fmt_ts(c)} ({c:.2f}s)" for c in cuts)
+        prompt = prompt + CUT_HINT_SECTION.format(items=items)
     if not segments:
-        return base_prompt
+        return prompt
     items = "\n".join(
         f"- {fmt_ts(s['start'])}-{fmt_ts(s['end'])} (region: {s['region']}, "
         f"dominant motion axis: {s['axis']}, "
         f"mean magnitude {s['magnitude']} px/frame)"
         for s in segments
     )
-    return base_prompt + MOTION_HINT_SECTION.format(items=items)
+    return prompt + MOTION_HINT_SECTION.format(items=items)
+
+
+# ---------------- deterministic cut detection (provider-agnostic) ----------------
+
+def detect_cuts(path: str, threshold: float = 0.4) -> list:
+    """Detect hard cuts via ffmpeg scene detection.
+
+    Runs the `select` filter with `gt(scene,threshold)` and parses the
+    `showinfo` pts_time of each selected frame. Returns sorted timestamps
+    in seconds. Fails silent (returns []) on ffmpeg error.
+    """
+    r = subprocess.run(
+        ["ffmpeg", "-v", "info", "-i", path,
+         "-filter:v", f"select='gt(scene,{threshold})',showinfo",
+         "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    cuts = []
+    for line in (r.stderr or "").splitlines():
+        if "showinfo" not in line:
+            continue
+        m = re.search(r"pts_time:([0-9.]+)", line)
+        if m:
+            cuts.append(float(m.group(1)))
+    # Drop the t=0 selection (first frame always "selected") and dedupe.
+    cuts = sorted({c for c in cuts if c > 0.05})
+    return cuts
 
 
 # ---------------- Gemini provider ----------------
@@ -453,7 +501,8 @@ def analyze_url_gemini(base: str, key: str, model: str, url: str,
 
 
 def analyze_file_gemini(base: str, key: str, model: str, path: str,
-                        prompt: str, want_motion: bool) -> str | None:
+                        prompt: str, want_motion: bool,
+                        cut_threshold: float | None) -> str | None:
     info = validate_video(path)
     print(f"validated: {info['video_codec']}, {info['duration']:.0f}s, "
           f"audio={'yes' if info['has_audio'] else 'no'}", file=sys.stderr)
@@ -468,6 +517,12 @@ def analyze_file_gemini(base: str, key: str, model: str, path: str,
     file_uri = gemini_wait_active(base, key, file_name)
     if not file_uri:
         return None
+    cuts = []
+    if cut_threshold is not None:
+        print("detecting hard cuts (ffmpeg scene detection)...",
+              file=sys.stderr)
+        cuts = detect_cuts(path, cut_threshold)
+        print(f"  {len(cuts)} cuts detected", file=sys.stderr)
     segments = []
     if want_motion:
         print("pass 1: optical flow looking for subtle motion...",
@@ -478,14 +533,15 @@ def analyze_file_gemini(base: str, key: str, model: str, path: str,
                   f"({s['region']}, mag {s['magnitude']})", file=sys.stderr)
         if not segments:
             print("  no subtle motion above noise floor", file=sys.stderr)
-    parts = [{"text": build_prompt(segments, prompt)},
+    parts = [{"text": build_prompt(segments, prompt, cuts)},
              {"file_data": {"file_uri": file_uri, "mime_type": mime}}]
     return gemini_generate(base, key, model, parts)
 
 
 def analyze_file_openai(base: str, key: str, model: str, path: str,
                         prompt: str, want_motion: bool,
-                        keyframes: int) -> str | None:
+                        keyframes: int,
+                        cut_threshold: float | None) -> str | None:
     info = validate_video(path)
     print(f"validated: {info['video_codec']}, {info['duration']:.0f}s, "
           f"audio={'yes' if info['has_audio'] else 'no'}", file=sys.stderr)
@@ -494,12 +550,18 @@ def analyze_file_openai(base: str, key: str, model: str, path: str,
     if not kf_paths:
         print("error: could not extract keyframes", file=sys.stderr)
         return None
+    cuts = []
+    if cut_threshold is not None:
+        print("detecting hard cuts (ffmpeg scene detection)...",
+              file=sys.stderr)
+        cuts = detect_cuts(path, cut_threshold)
+        print(f"  {len(cuts)} cuts detected", file=sys.stderr)
     segments = []
     if want_motion:
         print("pass 1: optical flow looking for subtle motion...",
               file=sys.stderr)
         segments = detect_subtle_motion(path)
-    content = [{"type": "text", "text": build_prompt(segments, prompt)}]
+    content = [{"type": "text", "text": build_prompt(segments, prompt, cuts)}]
     try:
         for i, kf in enumerate(kf_paths):
             with open(kf, "rb") as f:
@@ -534,7 +596,8 @@ section.\
 
 
 def analyze_aux_fast(aux: dict, path: str, prompt: str, want_motion: bool,
-                     keyframes: int) -> str | None:
+                     keyframes: int,
+                     cut_threshold: float | None) -> str | None:
     """Modo Rapido: whole analysis on the auxiliary model via keyframes.
 
     No full upload, no native temporal sampling. The optical-flow pass
@@ -550,6 +613,12 @@ def analyze_aux_fast(aux: dict, path: str, prompt: str, want_motion: bool,
     if not kf_paths:
         print("error: could not extract keyframes", file=sys.stderr)
         return None
+    cuts = []
+    if cut_threshold is not None:
+        print("detecting hard cuts (ffmpeg scene detection)...",
+              file=sys.stderr)
+        cuts = detect_cuts(path, cut_threshold)
+        print(f"  {len(cuts)} cuts detected", file=sys.stderr)
     segments = []
     if want_motion:
         print("pass 1: optical flow looking for subtle motion...",
@@ -558,7 +627,7 @@ def analyze_aux_fast(aux: dict, path: str, prompt: str, want_motion: bool,
         for s in segments:
             print(f"  subtle motion: {fmt_ts(s['start'])}-{fmt_ts(s['end'])} "
                   f"({s['region']}, mag {s['magnitude']})", file=sys.stderr)
-    full_prompt = AUX_FAST_PREAMBLE + build_prompt(segments, prompt)
+    full_prompt = AUX_FAST_PREAMBLE + build_prompt(segments, prompt, cuts)
     content = [{"type": "text", "text": full_prompt}]
     try:
         for i, kf in enumerate(kf_paths):
@@ -660,6 +729,12 @@ def main() -> int:
                    help="Custom analysis prompt (overrides the default)")
     p.add_argument("--no-motion", action="store_true",
                    help="Skip the optical-flow subtle-motion pass")
+    p.add_argument("--cut-threshold", type=float, default=0.4,
+                   help="Scene-detection threshold for deterministic cut "
+                        "detection (ffmpeg). Lower = more sensitive. "
+                        "Default: 0.4")
+    p.add_argument("--no-cuts", action="store_true",
+                   help="Skip deterministic cut detection")
     p.add_argument("--keyframes", type=int, default=KEYFRAME_COUNT,
                    help="Keyframes for the openai provider / aux model (default: 8)")
     args = p.parse_args()
@@ -668,6 +743,7 @@ def main() -> int:
     aux = get_aux_config(args)
     prompt = args.prompt or ANALYZE_PROMPT
     want_motion = not args.no_motion
+    cut_threshold = None if args.no_cuts else args.cut_threshold
 
     if args.fast and not aux:
         print("error: --fast (Modo Rapido) requires an auxiliary model. "
@@ -690,12 +766,15 @@ def main() -> int:
                 print(f"error: file not found: {args.source}", file=sys.stderr)
                 return 2
             report = analyze_aux_fast(aux, args.source, prompt,
-                                      want_motion, args.keyframes)
+                                      want_motion, args.keyframes,
+                                      cut_threshold)
         elif args.provider == "gemini":
             base = GEMINI_API_BASE
             if is_url(args.source):
                 print("URL mode: sending straight to the model, no download...",
                       file=sys.stderr)
+                print("note: cut detection unavailable in URL mode "
+                      "(requires the file)", file=sys.stderr)
                 report = analyze_url_gemini(base, key, args.model,
                                             args.source, prompt)
             else:
@@ -706,13 +785,15 @@ def main() -> int:
                 print("file mode: validation + native upload...",
                       file=sys.stderr)
                 report = analyze_file_gemini(base, key, args.model,
-                                             args.source, prompt, want_motion)
+                                             args.source, prompt, want_motion,
+                                             cut_threshold)
                 if not report and aux:
                     # Fallback: aux model with keyframes.
                     print("warn: primary analysis failed, falling back to "
                           "auxiliary model...", file=sys.stderr)
                     report = analyze_aux_fast(aux, args.source, prompt,
-                                              want_motion, args.keyframes)
+                                              want_motion, args.keyframes,
+                                              cut_threshold)
         else:  # openai-compatible
             if not os.path.isfile(args.source):
                 print(f"error: file not found: {args.source}", file=sys.stderr)
@@ -721,12 +802,14 @@ def main() -> int:
             print(f"file mode (openai-compatible): {args.keyframes} keyframes...",
                   file=sys.stderr)
             report = analyze_file_openai(base, key, args.model, args.source,
-                                         prompt, want_motion, args.keyframes)
+                                         prompt, want_motion, args.keyframes,
+                                         cut_threshold)
             if not report and aux:
                 print("warn: primary analysis failed, falling back to "
                       "auxiliary model...", file=sys.stderr)
                 report = analyze_aux_fast(aux, args.source, prompt,
-                                          want_motion, args.keyframes)
+                                          want_motion, args.keyframes,
+                                          cut_threshold)
     except Exception as exc:  # noqa: BLE001
         print(f"error: {exc}", file=sys.stderr)
         return 4
