@@ -72,11 +72,13 @@ import json
 import mimetypes
 import os
 import re
-import subprocess
+import shutil
+import subprocess  # nosec B404 - used only for local ffmpeg/ffprobe with fixed args
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_PROVIDER = "gemini"
@@ -90,6 +92,10 @@ KEYFRAME_COUNT = 8
 AUX_ENV_MODEL = "VIDEOLYZER_AUX_MODEL"
 AUX_ENV_BASE_URL = "VIDEOLYZER_AUX_BASE_URL"
 AUX_ENV_API_KEY = "VIDEOLYZER_AUX_API_KEY"
+
+# Resolve full binary paths (bandit B607: never exec via partial PATH lookup).
+FFMPEG = shutil.which("ffmpeg")
+FFPROBE = shutil.which("ffprobe")
 
 ANALYZE_PROMPT = """Analyze this video in depth and return a Markdown report with the following sections:
 
@@ -186,11 +192,16 @@ def fmt_ts(s: float) -> str:
 def http_json(url: str, headers: dict, data: bytes | None = None,
               timeout: int = 600, method: str = "POST") -> dict | None:
     """Request with retry on 429/5xx. Returns parsed JSON or None."""
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        print(f"error: refusing non-HTTP(S) URL scheme: {scheme}",
+              file=sys.stderr)
+        return None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     last_err = None
     for attempt in range(MAX_RETRIES):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 - scheme validated to http/https above
                 return json.load(resp)
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503):
@@ -245,8 +256,11 @@ def detect_subtle_motion(path: str, sample_fps: float = 2.0) -> list:
                 gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
                 t = idx / fps
                 if prev_gray is not None and prev_gray.shape == gray.shape:
-                    flow = cv2.calcOpticalFlowFarneback(
-                        prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+                    # cv2 stubs don't cover flow=None (standard allocate-output
+                    # idiom); verified correct at runtime
+                    flow = cv2.calcOpticalFlowFarneback(  # pyright: ignore[reportCallIssue]
+                        prev_gray, gray, None,  # pyright: ignore[reportArgumentType]
+                        0.5, 3, 15, 3, 5, 1.2, 0)
                     mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
                     gh, gw = mag.shape
                     ch, cw = max(1, gh // 3), max(1, gw // 3)
@@ -345,10 +359,13 @@ def detect_cuts(path: str, threshold: float = 0.4) -> list:
 
     Runs the `select` filter with `gt(scene,threshold)` and parses the
     `showinfo` pts_time of each selected frame. Returns sorted timestamps
-    in seconds. Fails silent (returns []) on ffmpeg error.
+    in seconds. Fails silent (returns []) on ffmpeg error or if ffmpeg
+    is not installed.
     """
-    r = subprocess.run(
-        ["ffmpeg", "-v", "info", "-i", path,
+    if not FFMPEG:
+        return []
+    r = subprocess.run(  # nosec B603 - args are fixed strings, no shell
+        [FFMPEG, "-v", "info", "-i", path,
          "-filter:v", f"select='gt(scene,{threshold})',showinfo",
          "-f", "null", "-"],
         capture_output=True, text=True,
@@ -401,11 +418,16 @@ def gemini_wait_active(base: str, key: str, file_name: str,
                        timeout_s: int = 300) -> str | None:
     """Wait for the file to leave PROCESSING. Returns the file URI."""
     url = f"{base}/{file_name}?key={key}"
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        print(f"error: refusing non-HTTP(S) URL scheme: {scheme}",
+              file=sys.stderr)
+        return None
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         req = urllib.request.Request(url, method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:  # nosec B310 - scheme validated above
                 data = json.load(resp)
         except urllib.error.HTTPError as e:
             # transient 400 while the file is still being indexed
@@ -431,8 +453,10 @@ def gemini_wait_active(base: str, key: str, file_name: str,
 
 def validate_video(path: str) -> dict:
     """ffprobe: validate codec, duration, streams, integrity. No frame extraction."""
-    r = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json",
+    if not FFPROBE:
+        raise RuntimeError("ffprobe not found in PATH")
+    r = subprocess.run(  # nosec B603 - args are fixed strings, no shell
+        [FFPROBE, "-v", "error", "-print_format", "json",
          "-show_format", "-show_streams", path],
         capture_output=True, text=True,
     )
@@ -457,13 +481,15 @@ def validate_video(path: str) -> dict:
 
 def extract_keyframes(path: str, count: int, duration: float) -> list:
     """Extract `count` evenly spaced JPEG keyframes. Returns temp paths."""
+    if not FFMPEG:
+        raise RuntimeError("ffmpeg not found in PATH")
     paths = []
     for i in range(count):
         t = duration * (i + 0.5) / count if duration > 0 else i
         tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
         tmp.close()
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", path,
+        r = subprocess.run(  # nosec B603 - args are fixed strings, no shell
+            [FFMPEG, "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", path,
              "-frames:v", "1", "-vf", "scale=1024:-1", "-q:v", "4", tmp.name],
             capture_output=True,
         )
@@ -561,7 +587,7 @@ def analyze_file_openai(base: str, key: str, model: str, path: str,
         print("pass 1: optical flow looking for subtle motion...",
               file=sys.stderr)
         segments = detect_subtle_motion(path)
-    content = [{"type": "text", "text": build_prompt(segments, prompt, cuts)}]
+    content: list[dict] = [{"type": "text", "text": build_prompt(segments, prompt, cuts)}]
     try:
         for i, kf in enumerate(kf_paths):
             with open(kf, "rb") as f:
@@ -628,7 +654,7 @@ def analyze_aux_fast(aux: dict, path: str, prompt: str, want_motion: bool,
             print(f"  subtle motion: {fmt_ts(s['start'])}-{fmt_ts(s['end'])} "
                   f"({s['region']}, mag {s['magnitude']})", file=sys.stderr)
     full_prompt = AUX_FAST_PREAMBLE + build_prompt(segments, prompt, cuts)
-    content = [{"type": "text", "text": full_prompt}]
+    content: list[dict] = [{"type": "text", "text": full_prompt}]
     try:
         for i, kf in enumerate(kf_paths):
             with open(kf, "rb") as f:
@@ -671,7 +697,7 @@ def analyze_aux_verify(aux: dict, path: str, primary_report: str,
         "temporal-order mistake (wrong event sequence). Be terse.\n\n"
         "--- PRIMARY REPORT ---\n" + primary_report
     )
-    content = [{"type": "text", "text": verify_prompt}]
+    content: list[dict] = [{"type": "text", "text": verify_prompt}]
     try:
         for i, kf in enumerate(kf_paths):
             with open(kf, "rb") as f:
@@ -762,6 +788,8 @@ def main() -> int:
     try:
         if args.fast:
             # Modo Rapido: everything on the aux model via keyframes.
+            if aux is None:  # unreachable: validated above, narrows type
+                raise RuntimeError("aux model required for --fast")
             if not os.path.isfile(args.source):
                 print(f"error: file not found: {args.source}", file=sys.stderr)
                 return 2
@@ -820,6 +848,8 @@ def main() -> int:
 
     # Second opinion (optional): aux model cross-checks the primary report.
     if args.verify and not args.fast and not is_url(args.source):
+        if aux is None:  # unreachable: validated above, narrows type
+            raise RuntimeError("aux model required for --verify")
         print("second opinion: aux model reviewing the report...",
               file=sys.stderr)
         verdict = analyze_aux_verify(aux, args.source, report, args.keyframes)
