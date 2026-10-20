@@ -7,6 +7,8 @@ Usage:
         [--prompt "..."] [--no-motion] [--no-cuts] [--cut-threshold 0.4]
         [--keyframes 8]
         [--aux-model NAME] [--aux-base-url URL] [--aux-api-key KEY] [--fast]
+        [--strips] [--strip-frames 8] [--max-strips 24]
+        [--lang LANG] [--stt-model NAME] [--transcribe]
 
 Providers:
     gemini  - Google AI Studio. Native video understanding, YouTube URLs
@@ -27,6 +29,11 @@ Auxiliary model (--aux-model):
       - Temporal verifier: confirm event order across keyframes.
       - Fallback: automatically used (keyframes) when the primary analysis
         fails, if configured.
+    Frame strips (--strips or VIDEOLYZER_STRIPS=1): instead of evenly spaced
+    keyframes, the aux model gets one image per shot (top row spread across
+    the shot, bottom row consecutive frames) plus per-shot cadence (ones/
+    twos/threes), hold and camera numbers measured locally. Built for
+    animation review; batched and merged for endpoints that cap images.
     Configured via --aux-model NAME, --aux-base-url URL, --aux-api-key KEY,
     or env vars VIDEOLYZER_AUX_MODEL, VIDEOLYZER_AUX_BASE_URL,
     VIDEOLYZER_AUX_API_KEY. No provider is hardcoded; any endpoint speaking
@@ -97,6 +104,64 @@ AUX_ENV_API_KEY = "VIDEOLYZER_AUX_API_KEY"
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
 
+# ---------------- local measurement cache ----------------
+# Deterministic passes (cut detection, optical flow, per-shot timing) are
+# pure functions of the video bytes + params. Cache them under
+# ~/.cache/videolyzer (or $VIDEOLYZER_CACHE_DIR) keyed by file hash so
+# re-runs skip minutes of recomputation. Disabled with --no-cache.
+
+CACHE_ENV = "VIDEOLYZER_CACHE_DIR"
+_NO_CACHE = False
+
+
+def _cache_dir() -> str | None:
+    d = os.environ.get(CACHE_ENV)
+    if not d:
+        d = os.path.join(os.path.expanduser("~"), ".cache", "videolyzer")
+    try:
+        os.makedirs(d, exist_ok=True)
+        return d
+    except OSError:
+        return None
+
+
+def _file_hash(path: str) -> str | None:
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()[:32]
+    except OSError:
+        return None
+
+
+def _cached(kind: str, path: str, params: str, compute):
+    """Return cached result for (kind, file, params) or run compute()."""
+    cpath = None
+    if not _NO_CACHE:
+        d = _cache_dir()
+        fh = _file_hash(path) if d else None
+        if d and fh:
+            safe_params = re.sub(r"[^A-Za-z0-9_.-]", "_", params)[:64]
+            cpath = os.path.join(d, f"{kind}_{fh}_{safe_params}.json")
+            try:
+                with open(cpath) as f:
+                    return json.load(f)
+            except (OSError, ValueError):
+                pass
+    result = compute()
+    if cpath:
+        try:
+            tmp = cpath + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(result, f)
+            os.replace(tmp, cpath)
+        except OSError:
+            pass
+    return result
+
 ANALYZE_PROMPT = """Analyze this video in depth and return a Markdown report with the following sections:
 
 # Video Analysis
@@ -143,6 +208,15 @@ visual change (camera angle, location) without a hard cut.
 {items}
 """
 
+TRANSCRIPT_HINT_SECTION = """
+## Transcript (measured, dedicated speech-to-text model)
+The transcript below was produced by a dedicated transcription model and
+is GROUND TRUTH for what is said and when. Do NOT invent dialogue that
+contradicts it; if a scene has no transcript lines, say "no dialogue".
+Align your "Aligned transcript" section on these timestamps.
+{items}
+"""
+
 
 def is_url(s: str) -> bool:
     return s.startswith("http://") or s.startswith("https://")
@@ -185,8 +259,205 @@ def get_aux_config(args) -> dict | None:
             "api_key": api_key.strip()}
 
 
+# Speech-to-text (dedicated transcriber, e.g. whisper large-v3 via any
+# OpenAI-compatible /audio/transcriptions endpoint). Takes the audio load
+# off the vision model: the transcript becomes ground truth in the prompt.
+STT_ENV_MODEL = "VIDEOLYZER_STT_MODEL"
+STT_ENV_BASE_URL = "VIDEOLYZER_STT_BASE_URL"
+STT_ENV_API_KEY = "VIDEOLYZER_STT_API_KEY"
+STT_DEFAULT_MODEL = "whisper-1"
+
+
+def get_stt_config(args) -> dict | None:
+    """STT endpoint config. None when not configured.
+
+    Precedence: flags > VIDEOLYZER_STT_* env vars. Unlike the aux model,
+    the base URL and API key fall back to the primary provider's when not
+    set (same account often serves both).
+    """
+    if not args.transcribe:
+        return None
+    model = (args.stt_model or os.environ.get(STT_ENV_MODEL)
+             or STT_DEFAULT_MODEL).strip()
+    base_url = (args.stt_base_url or os.environ.get(STT_ENV_BASE_URL)
+                or args.base_url or OPENAI_API_BASE).rstrip("/")
+    api_key = (args.stt_api_key or os.environ.get(STT_ENV_API_KEY)
+               or args.api_key or os.environ.get("VIDEOLYZER_API_KEY")
+               or os.environ.get("OPENAI_API_KEY"))
+    if not api_key or not api_key.strip():
+        print(
+            f"error: --transcribe set but no STT API key. Use --stt-api-key "
+            f"or set {STT_ENV_API_KEY} (or reuse the primary --api-key).",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+    return {"model": model, "base_url": base_url,
+            "api_key": api_key.strip()}
+
+
+def extract_audio(path: str) -> str | None:
+    """Extract mono 16 kHz WAV for the transcriber. Returns temp path or None."""
+    if not FFMPEG:
+        return None
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    r = subprocess.run(  # nosec B603 - args are fixed strings, no shell
+        [FFMPEG, "-y", "-v", "error", "-i", path,
+         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", tmp.name],
+        capture_output=True,
+    )
+    if r.returncode == 0 and os.path.getsize(tmp.name) > 0:
+        return tmp.name
+    try:
+        os.unlink(tmp.name)
+    except OSError:
+        pass
+    return None
+
+
+def _multipart_body(fields: dict, file_field: str, file_name: str,
+                    file_bytes: bytes) -> tuple[bytes, str]:
+    """Minimal multipart/form-data encoder (stdlib only)."""
+    import secrets
+    boundary = "----videolyzer" + secrets.token_hex(16)
+    parts = []
+    for k, v in fields.items():
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'
+        )
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{file_field}"; '
+        f'filename="{file_name}"\r\n'
+        "Content-Type: audio/wav\r\n\r\n"
+    )
+    head = "".join(parts).encode()
+    tail = f"\r\n--{boundary}--\r\n".encode()
+    return head + file_bytes + tail, boundary
+
+
+def transcribe_audio(cfg: dict, wav_path: str) -> str | None:
+    """Transcribe via {base}/audio/transcriptions (OpenAI-compatible).
+
+    Tries verbose_json (segments with timestamps) first, falls back to
+    plain json. Returns formatted "[mm:ss] text" lines or None.
+    """
+    url = f"{cfg['base_url']}/audio/transcriptions"
+    if urllib.parse.urlparse(url).scheme.lower() not in ("http", "https"):
+        print("error: refusing non-HTTP(S) STT URL scheme", file=sys.stderr)
+        return None
+    try:
+        with open(wav_path, "rb") as f:
+            audio = f.read()
+    except OSError:
+        return None
+    size_mb = len(audio) / (1 << 20)
+    if size_mb > 25:
+        print(f"warn: audio is {size_mb:.0f} MB; many STT endpoints cap "
+              f"uploads at 25 MB and may reject it", file=sys.stderr)
+    for fmt in ("verbose_json", "json"):
+        body, boundary = _multipart_body(
+            {"model": cfg["model"], "response_format": fmt,
+             "temperature": "0"},
+            "file", "audio.wav", audio)
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
+                   "Authorization": f"Bearer {cfg['api_key']}"}
+        data = http_json(url, headers, body, timeout=600)
+        if not data:
+            continue
+        try:
+            if fmt == "verbose_json" and "segments" in data:
+                lines = []
+                for s in data["segments"]:
+                    t = s.get("text", "").strip()
+                    if t:
+                        lines.append(f"[{fmt_ts(float(s.get('start', 0)))}] {t}")
+                if lines:
+                    return "\n".join(lines)
+            elif "text" in data and data["text"].strip():
+                return data["text"].strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def _whispero_bin() -> str | None:
+    """Path of the installed `whispero` CLI, or None."""
+    return shutil.which("whispero")
+
+
+def _stt_http_explicit(args) -> bool:
+    """True when the user explicitly configured an HTTP STT endpoint."""
+    return bool(args.stt_model or args.stt_base_url or args.stt_api_key
+                or os.environ.get(STT_ENV_MODEL)
+                or os.environ.get(STT_ENV_BASE_URL)
+                or os.environ.get(STT_ENV_API_KEY))
+
+
+def _srt_to_lines(srt_path: str) -> str | None:
+    """Parse whispero's SRT output into '[mm:ss] text' lines."""
+    try:
+        with open(srt_path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    lines = []
+    for block in text.strip().split("\n\n"):
+        parts = block.strip().splitlines()
+        if len(parts) < 3:
+            continue
+        m = re.match(r"(\d{2}):(\d{2}):(\d{2})", parts[1])
+        if not m:
+            continue
+        h, mi, s = (int(x) for x in m.groups())
+        body = " ".join(p.strip() for p in parts[2:] if p.strip())
+        if body:
+            lines.append(f"[{fmt_ts(h * 3600 + mi * 60 + s)}] {body}")
+    return "\n".join(lines) if lines else None
+
+
+def transcribe_via_whispero(wav_path: str, timeout: int = 900) -> str | None:
+    """Transcribe with the installed `whispero` CLI (local faster-whisper).
+
+    Uses --format srt so segments keep timestamps (plus speaker tags when
+    diarization is on). Returns '[mm:ss] text' lines or None.
+    """
+    exe = _whispero_bin()
+    if not exe:
+        return None
+    tmp = tempfile.NamedTemporaryFile(suffix=".srt", delete=False)
+    tmp.close()
+    try:
+        r = subprocess.run(  # nosec B603 - fixed args, binary from PATH
+            [exe, wav_path, "--format", "srt", "--output", tmp.name],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode != 0:
+            print(f"warn: whispero failed: "
+                  f"{(r.stderr or '').strip()[-200:]}", file=sys.stderr)
+            return None
+        return _srt_to_lines(tmp.name)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"warn: whispero backend failed: {e}", file=sys.stderr)
+        return None
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 def fmt_ts(s: float) -> str:
     return f"{int(s // 60):02d}:{int(s % 60):02d}"
+
+
+def _with_lang(text: str, lang: str | None) -> str:
+    """Append a report-language instruction. Universal: any language the
+    model understands, e.g. --lang pt, --lang es, --lang 日本語."""
+    if lang and lang.strip():
+        return text.rstrip() + f"\n\nWrite the entire report in {lang.strip()}."
+    return text
 
 
 def http_json(url: str, headers: dict, data: bytes | None = None,
@@ -227,7 +498,13 @@ def detect_subtle_motion(path: str, sample_fps: float = 2.0) -> list:
     and flags segments where the most active cell beats background noise
     (median + 4*1.4826*MAD, robust to outliers, with absolute floor).
     Returns list of {start, end, region, magnitude, axis}. Fails silent.
+    Results are cached per video+sample rate.
     """
+    return _cached("motion", path, f"fps{sample_fps}",
+                   lambda: _detect_subtle_motion_raw(path, sample_fps))
+
+
+def _detect_subtle_motion_raw(path: str, sample_fps: float = 2.0) -> list:
     try:
         import cv2
         import numpy as np
@@ -336,11 +613,14 @@ def detect_subtle_motion(path: str, sample_fps: float = 2.0) -> list:
     return result
 
 
-def build_prompt(segments: list, base_prompt: str, cuts: list | None = None) -> str:
+def build_prompt(segments: list, base_prompt: str, cuts: list | None = None,
+               transcript: str | None = None) -> str:
     prompt = base_prompt
     if cuts:
         items = "\n".join(f"- cut at {fmt_ts(c)} ({c:.2f}s)" for c in cuts)
         prompt = prompt + CUT_HINT_SECTION.format(items=items)
+    if transcript and transcript.strip():
+        prompt = prompt + TRANSCRIPT_HINT_SECTION.format(items=transcript.strip())
     if not segments:
         return prompt
     items = "\n".join(
@@ -360,8 +640,13 @@ def detect_cuts(path: str, threshold: float = 0.4) -> list:
     Runs the `select` filter with `gt(scene,threshold)` and parses the
     `showinfo` pts_time of each selected frame. Returns sorted timestamps
     in seconds. Fails silent (returns []) on ffmpeg error or if ffmpeg
-    is not installed.
+    is not installed. Results are cached per video+threshold.
     """
+    return _cached("cuts", path, f"thr{threshold}",
+                   lambda: _detect_cuts_raw(path, threshold))
+
+
+def _detect_cuts_raw(path: str, threshold: float) -> list:
     if not FFMPEG:
         return []
     r = subprocess.run(  # nosec B603 - args are fixed strings, no shell
@@ -474,6 +759,7 @@ def validate_video(path: str) -> dict:
         "size": int(fmt.get("size", 0)),
         "video_codec": video[0].get("codec_name"),
         "has_audio": bool(audio),
+        "fps": video[0].get("r_frame_rate", "24/1"),
     }
 
 
@@ -498,6 +784,58 @@ def extract_keyframes(path: str, count: int, duration: float) -> list:
         else:
             os.unlink(tmp.name)
     return paths
+
+
+def openai_chat_stream(base: str, key: str, model: str,
+                       messages: list) -> str | None:
+    """Same call as openai_chat, streamed (SSE). Reasoning models can think
+    for minutes before the first content token; streaming keeps proxies and
+    gateways with ~100 s idle timeouts from cutting the request."""
+    url = f"{base.rstrip('/')}/chat/completions"
+    if urllib.parse.urlparse(url).scheme.lower() not in ("http", "https"):
+        print("error: refusing non-HTTP(S) URL scheme", file=sys.stderr)
+        return None
+    body = json.dumps({"model": model, "messages": messages,
+                       "max_tokens": 8192, "stream": True}).encode()
+    last_err: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        req = urllib.request.Request(url, data=body, method="POST", headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}"})
+        try:
+            parts = []
+            with urllib.request.urlopen(req, timeout=600) as resp:  # nosec B310 - scheme validated above
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:") or line == "data: [DONE]":
+                        continue
+                    try:
+                        choice = json.loads(line[5:])["choices"][0]
+                    except (ValueError, KeyError, IndexError):
+                        continue
+                    parts.append((choice.get("delta") or {}).get("content") or "")
+                    if choice.get("finish_reason") == "length":
+                        print("warn: aux answer hit max_tokens and was cut",
+                              file=sys.stderr)
+            text = "".join(parts).strip()
+            if text:
+                return text
+            last_err = RuntimeError("empty streamed response")
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504, 524):
+                print(f"error: API {e.code}: "
+                      f"{e.read().decode(errors='replace')[:300]}", file=sys.stderr)
+                return None
+            last_err = e
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+        print(f"warn: aux attempt {attempt + 1} failed: {last_err}",
+              file=sys.stderr)
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_DELAYS[attempt])
+    print(f"warn: aux stream failed after {MAX_RETRIES} tries: {last_err}",
+          file=sys.stderr)
+    return None
 
 
 def openai_chat(base: str, key: str, model: str, messages: list) -> str | None:
@@ -528,7 +866,8 @@ def analyze_url_gemini(base: str, key: str, model: str, url: str,
 
 def analyze_file_gemini(base: str, key: str, model: str, path: str,
                         prompt: str, want_motion: bool,
-                        cut_threshold: float | None) -> str | None:
+                        cut_threshold: float | None,
+                        transcript: str | None = None) -> str | None:
     info = validate_video(path)
     print(f"validated: {info['video_codec']}, {info['duration']:.0f}s, "
           f"audio={'yes' if info['has_audio'] else 'no'}", file=sys.stderr)
@@ -559,7 +898,7 @@ def analyze_file_gemini(base: str, key: str, model: str, path: str,
                   f"({s['region']}, mag {s['magnitude']})", file=sys.stderr)
         if not segments:
             print("  no subtle motion above noise floor", file=sys.stderr)
-    parts = [{"text": build_prompt(segments, prompt, cuts)},
+    parts = [{"text": build_prompt(segments, prompt, cuts, transcript)},
              {"file_data": {"file_uri": file_uri, "mime_type": mime}}]
     return gemini_generate(base, key, model, parts)
 
@@ -567,7 +906,8 @@ def analyze_file_gemini(base: str, key: str, model: str, path: str,
 def analyze_file_openai(base: str, key: str, model: str, path: str,
                         prompt: str, want_motion: bool,
                         keyframes: int,
-                        cut_threshold: float | None) -> str | None:
+                        cut_threshold: float | None,
+                        transcript: str | None = None) -> str | None:
     info = validate_video(path)
     print(f"validated: {info['video_codec']}, {info['duration']:.0f}s, "
           f"audio={'yes' if info['has_audio'] else 'no'}", file=sys.stderr)
@@ -587,7 +927,7 @@ def analyze_file_openai(base: str, key: str, model: str, path: str,
         print("pass 1: optical flow looking for subtle motion...",
               file=sys.stderr)
         segments = detect_subtle_motion(path)
-    content: list[dict] = [{"type": "text", "text": build_prompt(segments, prompt, cuts)}]
+    content: list[dict] = [{"type": "text", "text": build_prompt(segments, prompt, cuts, transcript)}]
     try:
         for i, kf in enumerate(kf_paths):
             with open(kf, "rb") as f:
@@ -623,7 +963,8 @@ section.\
 
 def analyze_aux_fast(aux: dict, path: str, prompt: str, want_motion: bool,
                      keyframes: int,
-                     cut_threshold: float | None) -> str | None:
+                     cut_threshold: float | None,
+                     transcript: str | None = None) -> str | None:
     """Modo Rapido: whole analysis on the auxiliary model via keyframes.
 
     No full upload, no native temporal sampling. The optical-flow pass
@@ -653,7 +994,7 @@ def analyze_aux_fast(aux: dict, path: str, prompt: str, want_motion: bool,
         for s in segments:
             print(f"  subtle motion: {fmt_ts(s['start'])}-{fmt_ts(s['end'])} "
                   f"({s['region']}, mag {s['magnitude']})", file=sys.stderr)
-    full_prompt = AUX_FAST_PREAMBLE + build_prompt(segments, prompt, cuts)
+    full_prompt = AUX_FAST_PREAMBLE + build_prompt(segments, prompt, cuts, transcript)
     content: list[dict] = [{"type": "text", "text": full_prompt}]
     try:
         for i, kf in enumerate(kf_paths):
@@ -678,47 +1019,494 @@ def analyze_aux_fast(aux: dict, path: str, prompt: str, want_motion: bool,
 
 
 def analyze_aux_verify(aux: dict, path: str, primary_report: str,
-                       keyframes: int) -> str | None:
+                       keyframes: int, strips: bool = False,
+                       strip_frames: int | None = None,
+                       max_strips: int | None = None,
+                       cut_threshold: float | None = None,
+                       lang: str | None = None) -> str | None:
     """Second opinion: the aux model cross-checks the primary report.
 
     Sends keyframes plus the primary report and asks for agreement /
-    disagreement per scene, focusing on temporal claims. Returns the
-    verdict text or None.
+    disagreement per scene, focusing on temporal claims. In strips mode
+    it sends per-shot frame strips with the measured cadence/camera
+    numbers instead of evenly spaced keyframes. Returns the verdict text
+    or None.
     """
+    # Defaults resolved at call time: the STRIP_* constants are defined
+    # further below in this module (after this function).
+    if strip_frames is None:
+        strip_frames = STRIP_FRAMES
+    if max_strips is None:
+        max_strips = MAX_STRIPS
     info = validate_video(path)
-    kf_paths = extract_keyframes(path, keyframes, info["duration"])
-    if not kf_paths:
-        return None
-    verify_prompt = (
-        "You are a second-opinion reviewer. Below is a video analysis report "
-        "produced by another model from evenly spaced keyframes of the same "
-        "video. Review each scene claim against the frames: say which claims "
-        "you AGREE with, which you DISAGREE with (and why), and flag any "
-        "temporal-order mistake (wrong event sequence). Be terse.\n\n"
-        "--- PRIMARY REPORT ---\n" + primary_report
-    )
-    content: list[dict] = [{"type": "text", "text": verify_prompt}]
+    content: list[dict] = []
+    paths: list[str] = []
     try:
-        for i, kf in enumerate(kf_paths):
-            with open(kf, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("ascii")
+        if strips:
+            duration = info["duration"]
+            try:
+                num, den = info.get("fps", "24/1").split("/")
+                fps = float(num) / float(den or 1) or 24.0
+            except (ValueError, ZeroDivisionError, AttributeError):
+                fps = 24.0
+            cuts = detect_cuts(path, min(cut_threshold if cut_threshold
+                                         is not None else STRIP_CUT_THRESHOLD,
+                                         STRIP_CUT_THRESHOLD))
+            shots = shot_list(duration, cuts)
+            stats = shot_timing_stats(path, shots) or [
+                {"start": s, "end": e, "note": "opencv not installed"}
+                for s, e in shots]
+            order = list(range(len(shots)))
+            if len(order) > max_strips:
+                order = [order[round(i * (len(order) - 1) / (max_strips - 1))]
+                         for i in range(max_strips)]
+            table = "\n".join(fmt_shot(i, stats[i]) for i in order)
+            verify_prompt = (
+                "You are a second-opinion reviewer. Below is a video analysis "
+                "report produced by another model. You get one frame strip "
+                "per shot (in order, shot number printed on the image) plus "
+                "locally measured cadence/camera numbers, which are ground "
+                "truth for timing: trust them over your visual impression. "
+                "Review each scene claim against the strips and numbers: say "
+                "which claims you AGREE with, which you DISAGREE with (and "
+                "why), and flag any temporal-order mistake (wrong event "
+                "sequence). Be terse.\n\n"
+                f"Per-shot numbers:\n{table}\n\n"
+                "--- PRIMARY REPORT ---\n" + primary_report
+            )
             content.append({"type": "text",
-                            "text": f"[frame {i + 1}/{len(kf_paths)}]"})
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-            })
+                            "text": _with_lang(verify_prompt, lang)})
+            for i in order:
+                sp = extract_strip(path, shots[i][0], shots[i][1],
+                                   strip_frames, fps,
+                                   f"SHOT {i + 1}  ({shots[i][0]:.1f}s-"
+                                   f"{shots[i][1]:.1f}s)")
+                if not sp:
+                    continue
+                paths.append(sp)
+                with open(sp, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                content.append({"type": "text",
+                                "text": "[" + fmt_shot(i, stats[i]) + "]"})
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                })
+            if not paths:
+                return None
+        else:
+            kf_paths = extract_keyframes(path, keyframes, info["duration"])
+            if not kf_paths:
+                return None
+            paths = kf_paths
+            verify_prompt = (
+                "You are a second-opinion reviewer. Below is a video analysis report "
+                "produced by another model from evenly spaced keyframes of the same "
+                "video. Review each scene claim against the frames: say which claims "
+                "you AGREE with, which you DISAGREE with (and why), and flag any "
+                "temporal-order mistake (wrong event sequence). Be terse.\n\n"
+                "--- PRIMARY REPORT ---\n" + primary_report
+            )
+            content.append({"type": "text",
+                            "text": _with_lang(verify_prompt, lang)})
+            for i, kf in enumerate(kf_paths):
+                with open(kf, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                content.append({"type": "text",
+                                "text": f"[frame {i + 1}/{len(kf_paths)}]"})
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                })
         verdict = openai_chat(aux["base_url"], aux["api_key"], aux["model"],
                               [{"role": "user", "content": content}])
         if verdict:
             return "## Second opinion (auxiliary model)\n\n" + verdict
         return None
     finally:
-        for kf in kf_paths:
+        for p in paths:
             try:
-                os.unlink(kf)
+                os.unlink(p)
             except OSError:
                 pass
+
+
+# ---------------- per-shot frame strips (aux fallback for animation) ----------------
+
+STRIP_FRAMES = 8          # frames per row in each shot strip
+MAX_STRIPS = 24           # shots sent to the aux model (evenly sampled if more)
+STRIPS_PER_REQUEST = 6    # images per aux request (batched, then merged)
+STRIP_BATCH_DELAY = 2.0   # seconds between aux requests
+STRIP_CUT_THRESHOLD = 0.25  # scene threshold cap in strips mode
+STRIPS_ENV = "VIDEOLYZER_STRIPS"
+
+STRIPS_PREAMBLE = """\
+You are analyzing a video WITHOUT seeing it play. You get one image per shot, \
+in order, its shot number printed at the top. Each image has two rows of {n} \
+frames, left to right:
+- TOP row: frames spread evenly across the whole shot (staging, acting, \
+pose progression).
+- BOTTOM row: {n} CONSECUTIVE frames (1/{fps:.0f} s apart) from the middle \
+of the shot (timing).
+With each shot you also get numbers measured locally on every frame. They are \
+ground truth for timing: trust them over your visual impression for cadence \
+(ones/twos/threes), holds and camera speed, and do not invent frame-level \
+timing the numbers do not support. Use the frames for what numbers cannot \
+see: acting and gesture, staging and composition, character on-model \
+consistency between shots, line weight, palette, camera language (angle, \
+framing, move type) and how each shot flows into the next (match cuts, \
+eyelines, action carried across the cut). There is no audio: mark any \
+transcript section as unavailable.
+Glossary: "ones" = new drawing every frame; "twos" = every 2nd frame; \
+"threes" = every 3rd; "held" = no new drawing; "camera" = whole-frame \
+pan/zoom measured after removing it from the drawing changes.
+"""
+
+STRIPS_FOCUS = """
+Besides the sections above, include a section "## Animation and camera" with:
+cadence and timing (per shot and overall), consistency (on-model, line \
+weight, palette), acting, camera language, and shot-to-shot flow. Quote the \
+measured numbers where you use them. Say plainly when a frame is too small \
+to judge something.
+"""
+
+
+def shot_list(duration: float, cuts: list, min_len: float = 0.25) -> list:
+    """Shots as (start, end) seconds from cut times; merges flash-frame cuts."""
+    bounds = [0.0]
+    for c in sorted(cuts):
+        if c - bounds[-1] >= min_len and duration - c >= min_len:
+            bounds.append(c)
+    bounds.append(duration)
+    return list(zip(bounds[:-1], bounds[1:]))
+
+
+def shot_timing_stats(path: str, shots: list) -> list:
+    """Per-shot cadence and camera numbers from one decode pass (opencv).
+
+    Camera motion is the dominant similarity transform between frames (LK
+    features + RANSAC); a second transform takes a second layer (a held cel
+    over a scrolling background). A 'new drawing' is >0.4% of pixels still
+    changing after both are removed. Returns [] without opencv.
+    Results are cached per video+shot list.
+    """
+    import hashlib
+    shots_key = hashlib.sha256(json.dumps(
+        [[round(s, 3), round(e, 3)] for s, e in shots]).encode()).hexdigest()[:16]
+    return _cached("timing", path, f"shots{shots_key}",
+                   lambda: _shot_timing_stats_raw(path, shots))
+
+
+def _shot_timing_stats_raw(path: str, shots: list) -> list:
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+    except ImportError:
+        return []
+    cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    w, h = 240, 135
+    inner = np.zeros((h, w), bool)
+    inner[6:-6, 6:-6] = True
+    per = []  # (t, changed_fraction, camera_px_per_frame_at_1080p)
+    prev = None
+    k = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        g = cv2.GaussianBlur(cv2.cvtColor(cv2.resize(frame, (w, h),
+                                                     interpolation=cv2.INTER_AREA),
+                                          cv2.COLOR_BGR2GRAY), (3, 3), 0)
+        if prev is not None:
+            cands = [cv2.absdiff(g, prev)]
+            cam = 0.0
+            p0 = cv2.goodFeaturesToTrack(prev, 400, 0.005, 4)
+            if p0 is not None and len(p0) >= 12:
+                p1, st, _ = cv2.calcOpticalFlowPyrLK(prev, g, p0, None,
+                                                     winSize=(15, 15), maxLevel=3)
+                sel = st.ravel() == 1
+                a, b = p0[sel], p1[sel]
+                for layer in range(2):
+                    if len(a) < 10:
+                        break
+                    m, inl = cv2.estimateAffinePartial2D(
+                        a, b, method=cv2.RANSAC, ransacReprojThreshold=1.0)
+                    if m is None or inl.sum() < 8:
+                        break
+                    if layer == 0:
+                        zoom = abs(float(np.hypot(m[0, 0], m[1, 0])) - 1.0)
+                        cam = float(np.hypot(m[0, 2], m[1, 2])) * 1080 / h \
+                            + zoom * 1000
+                    cands.append(cv2.absdiff(cv2.warpAffine(
+                        prev, m, (w, h), borderMode=cv2.BORDER_REFLECT), g))
+                    keep = inl.ravel() == 0
+                    a, b = a[keep], b[keep]
+            resid = np.minimum.reduce(cands)
+            per.append((k / fps, float((resid[inner] > 14).mean()), cam))
+        prev = g
+        k += 1
+    cap.release()
+    stats = []
+    for s, e in shots:
+        rows = [r for r in per if s + 1.5 / fps < r[0] < e - 0.5 / fps]
+        if len(rows) < 3:
+            stats.append({"start": s, "end": e, "note": "too short to measure"})
+            continue
+        events = [i for i, r in enumerate(rows) if r[1] > 0.004]
+        gaps = [b - a for a, b in zip(events, events[1:]) if b - a <= 4]
+        counts = {n: gaps.count(n) for n in (1, 2, 3, 4)}
+        if len(events) < 4:
+            cadence = "held (no new drawings)"
+        else:
+            best = max(counts, key=lambda n: counts[n])
+            cadence = {1: "ones", 2: "twos", 3: "threes", 4: "fours"}[best]
+            if counts[best] < 0.5 * max(len(gaps), 1):
+                cadence += " (mixed)"
+        cams = sorted(r[2] for r in rows)
+        moving = [c for c in cams if c > 0.3]
+        stats.append({
+            "start": s, "end": e,
+            "cadence": cadence,
+            "new_drawing_frames": round(len(events) / len(rows), 2),
+            "held_frames": round(sum(1 for r in rows if r[1] < 0.001) / len(rows), 2),
+            "camera_moving": round(len(moving) / len(rows), 2),
+            "camera_px_per_frame": round(moving[len(moving) // 2], 1) if moving else 0.0,
+        })
+    return stats
+
+
+def _ckpt_path(kind: str, path: str, params: str) -> str | None:
+    """Checkpoint file path for resumable long runs, or None."""
+    d = _cache_dir()
+    fh = _file_hash(path) if d else None
+    if not (d and fh):
+        return None
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", params)[:64]
+    return os.path.join(d, f"ckpt_{kind}_{fh}_{safe}.json")
+
+
+def _ckpt_load(cpath: str | None) -> dict:
+    if not cpath:
+        return {}
+    try:
+        with open(cpath) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ckpt_save(cpath: str | None, data: dict) -> None:
+    if not cpath:
+        return
+    try:
+        tmp = cpath + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, cpath)
+    except OSError:
+        pass
+
+
+def _ckpt_delete(cpath: str | None) -> None:
+    if cpath:
+        try:
+            os.unlink(cpath)
+        except OSError:
+            pass
+
+
+def extract_strip(path: str, start: float, end: float, n: int,
+                  fps: float, label: str = "") -> str | None:
+    """One JPEG per shot: top row spread across the shot, bottom row
+    consecutive frames from its middle, the shot label burned in on top
+    (models keep shot identity better when it is inside the image).
+    Returns a temp path or None."""
+    if not FFMPEG:
+        return None
+    dur = max(end - start, 1.0 / fps)
+    mid = max(start, start + dur / 2 - n / (2 * fps))
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    tmp.close()
+    graph = (f"[0:v]fps={n / dur:.4f},scale=320:-2,tile={n}x1[top];"
+             f"[1:v]scale=320:-2,tile={n}x1[bot];[top][bot]vstack")
+    text = re.sub(r"[^A-Za-z0-9 .()-]", "", label)  # ':' would break drawtext
+    tag = (f",pad=iw:ih+44:0:44,drawtext=text='{text}':fontcolor=yellow:"
+           "fontsize=32:x=10:y=6") if text else ""
+    for g in ([graph + tag, graph] if tag else [graph]):  # no drawtext? no label
+        r = subprocess.run(  # nosec B603 - args are fixed strings, no shell
+            [FFMPEG, "-y", "-v", "error",
+             "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", path,
+             "-ss", f"{mid:.3f}", "-i", path,
+             "-filter_complex", g, "-frames:v", "1", "-q:v", "4", tmp.name],
+            capture_output=True,
+        )
+        if r.returncode == 0 and os.path.getsize(tmp.name) > 0:
+            return tmp.name
+    os.unlink(tmp.name)
+    return None
+
+
+def fmt_shot(i: int, st: dict) -> str:
+    head = (f"Shot {i + 1}: {fmt_ts(st['start'])}-{fmt_ts(st['end'])} "
+            f"({st['end'] - st['start']:.2f}s)")
+    if "cadence" not in st:
+        return head + " - " + st.get("note", "no timing numbers")
+    return (head + f" - cadence {st['cadence']}, new drawing on "
+            f"{st['new_drawing_frames']:.0%} of frames, drawing held on "
+            f"{st['held_frames']:.0%}, camera moving on {st['camera_moving']:.0%} "
+            f"(median {st['camera_px_per_frame']} px/frame at 1080p)")
+
+
+def analyze_aux_strips(aux: dict, path: str, prompt: str, want_motion: bool,
+                       cut_threshold: float | None,
+                       frames: int = STRIP_FRAMES,
+                       max_strips: int = MAX_STRIPS,
+                       resume: bool = True,
+                       lang: str | None = None,
+                       transcript: str | None = None) -> str | None:
+    """Aux analysis built for animation: one ordered frame strip per shot
+    plus locally measured cadence/camera numbers. Batched for endpoints that
+    take a limited number of images per request; batches are then merged.
+
+    Long runs checkpoint per-batch notes under the cache dir: if the run
+    dies mid-way, the next run resumes from the first missing batch
+    (disable with resume=False / --no-resume). The checkpoint is deleted
+    after a successful merge.
+    """
+    info = validate_video(path)
+    duration = info["duration"]
+    fps = 24.0
+    try:
+        num, den = info.get("fps", "24/1").split("/")
+        fps = float(num) / float(den or 1) or 24.0
+    except (ValueError, ZeroDivisionError, AttributeError):
+        pass
+    # Dark or low-contrast cuts (common in animation) score low: cap at 0.25.
+    cuts = detect_cuts(path, min(cut_threshold if cut_threshold is not None
+                                 else STRIP_CUT_THRESHOLD, STRIP_CUT_THRESHOLD))
+    shots = shot_list(duration, cuts)
+    cuts = [s for s, _ in shots[1:]]  # same numbering in prompt and strips
+    print(f"strips: {len(shots)} shots from {len(cuts)} cuts", file=sys.stderr)
+    stats = shot_timing_stats(path, shots) or \
+        [{"start": s, "end": e, "note": "opencv not installed"} for s, e in shots]
+    order = list(range(len(shots)))
+    if len(order) > max_strips:  # keep order, sample evenly
+        order = [order[round(i * (len(order) - 1) / (max_strips - 1))]
+                 for i in range(max_strips)]
+    segments = detect_subtle_motion(path) if want_motion else []
+    table = "\n".join(fmt_shot(i, st) for i, st in enumerate(stats))
+    lengths = sorted(e - s for s, e in shots)
+    summary = (f"Measured: {len(shots)} shots in {duration:.1f}s, median shot "
+               f"{lengths[len(lengths) // 2]:.2f}s, mean {duration / len(shots):.2f}s.\n"
+               f"Per-shot numbers (all shots):\n{table}\n")
+    preamble = STRIPS_PREAMBLE.format(n=frames, fps=fps)
+    batches = [order[i:i + STRIPS_PER_REQUEST]
+               for i in range(0, len(order), STRIPS_PER_REQUEST)]
+    # Checkpoint: per-batch notes keyed by video + strip config.
+    cpath = _ckpt_path("strips", path, f"f{frames}_m{max_strips}") \
+        if resume else None
+    notes_by_batch: dict[int, str] = {}
+    if cpath:
+        saved = _ckpt_load(cpath)
+        if saved.get("order") == order and isinstance(saved.get("notes"), dict):
+            notes_by_batch = {int(k): v for k, v in saved["notes"].items()}
+            if notes_by_batch:
+                print(f"strips: resuming, {len(notes_by_batch)}/"
+                      f"{len(batches)} batches already done",
+                      file=sys.stderr)
+    first_call = True
+    for bi, batch in enumerate(batches):
+        if bi in notes_by_batch:
+            continue  # checkpointed in a previous run
+        if not first_call:
+            time.sleep(STRIP_BATCH_DELAY)  # sequential and gentle on rate limits
+        first_call = False
+        content: list[dict] = []
+        paths = []
+        try:
+            for i in batch:
+                sp = extract_strip(path, shots[i][0], shots[i][1], frames, fps,
+                                   f"SHOT {i + 1}  ({shots[i][0]:.1f}s-{shots[i][1]:.1f}s)")
+                if not sp:
+                    continue
+                paths.append(sp)
+                with open(sp, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                content.append({"type": "text", "text": "[" + fmt_shot(i, stats[i]) + "]"})
+                content.append({"type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+            if not paths:
+                continue
+            if len(batches) == 1:
+                ask = _with_lang(preamble + summary
+                                 + build_prompt(segments, prompt, cuts, transcript)
+                                 + STRIPS_FOCUS, lang)
+            else:
+                ask = _with_lang(
+                    preamble + summary +
+                    f"\nThis is batch {bi + 1}/{len(batches)}. For each image, "
+                    "in order, start with the SHOT number printed on that "
+                    "image, then write 3-6 terse lines: what happens, acting, "
+                    "camera, cadence (from the numbers), consistency issues, "
+                    "and how it connects to the previous shot. Describe only "
+                    "what is in that image.", lang)
+            print(f"strips: batch {bi + 1}/{len(batches)} ({len(paths)} shots) "
+                  f"-> aux model '{aux['model']}'...", file=sys.stderr)
+            out = openai_chat_stream(aux["base_url"], aux["api_key"], aux["model"],
+                              [{"role": "user",
+                                "content": [{"type": "text", "text": ask}] + content}])
+        finally:
+            for sp in paths:
+                try:
+                    os.unlink(sp)
+                except OSError:
+                    pass
+        if out is None:
+            return None  # checkpoint kept: next run resumes here
+        if len(batches) == 1:
+            return out
+        notes_by_batch[bi] = out
+        _ckpt_save(cpath, {"order": order,
+                           "notes": {str(k): v
+                                     for k, v in notes_by_batch.items()}})
+    notes = [notes_by_batch[bi] for bi in range(len(batches))
+             if bi in notes_by_batch]
+    if not notes:
+        return None
+    group = ("" if len(shots) <= 40 else
+             f"\nThere are {len(shots)} shots: in the Scenes table group "
+             "consecutive shots into scenes (about 30 rows at most) and cite "
+             "the shot numbers each row covers. The per-shot notes are "
+             "appended to your report automatically; do not repeat them.\n")
+    merge = _with_lang(
+        preamble + summary + "\nPer-shot notes from the frame strips, in "
+        "order:\n\n" + "\n\n".join(notes) + "\n\nWrite the final report "
+        "from these notes and numbers.\n" + group +
+        build_prompt(segments, prompt, cuts, transcript) + STRIPS_FOCUS, lang)
+    report = openai_chat_stream(aux["base_url"], aux["api_key"], aux["model"],
+                                [{"role": "user", "content": merge}])
+    if report is None:
+        return None  # checkpoint kept: next run resumes here
+    _ckpt_delete(cpath)  # full success: checkpoint no longer needed
+    return (report.rstrip() + "\n\n## Per-shot notes (aux model, from frame strips)\n\n"
+            + "\n\n".join(notes) + "\n")
+
+
+def run_aux(aux: dict, args, path: str, prompt: str, want_motion: bool,
+            cut_threshold: float | None,
+            transcript: str | None = None) -> str | None:
+    """Aux analysis in the configured mode: frame strips or keyframes."""
+    if args.strips:
+        return analyze_aux_strips(aux, path, prompt, want_motion,
+                                  cut_threshold, args.strip_frames,
+                                  args.max_strips,
+                                  resume=not args.no_resume,
+                                  lang=args.lang,
+                                  transcript=transcript)
+    return analyze_aux_fast(aux, path, prompt, want_motion, args.keyframes,
+                            cut_threshold, transcript=transcript)
 
 
 # ---------------- main ----------------
@@ -750,9 +1538,43 @@ def main() -> int:
                    help="Second opinion: after the primary analysis, have the "
                         "auxiliary model cross-check the report. "
                         "Requires --aux-model.")
+    p.add_argument("--strips", action="store_true",
+                   default=os.environ.get(STRIPS_ENV, "") not in ("", "0"),
+                   help="Aux model (--fast and the fallback) gets one ordered "
+                        "frame strip per shot plus measured cadence/camera "
+                        f"numbers instead of evenly spaced keyframes (or {STRIPS_ENV}=1)")
+    p.add_argument("--strip-frames", type=int, default=STRIP_FRAMES,
+                   help=f"Frames per strip row (default: {STRIP_FRAMES})")
+    p.add_argument("--max-strips", type=int, default=MAX_STRIPS,
+                   help=f"Max shots sent as strips (default: {MAX_STRIPS})")
     p.add_argument("--out", default=None, help="Output .md file (default: stdout)")
     p.add_argument("--prompt", default=None,
                    help="Custom analysis prompt (overrides the default)")
+    p.add_argument("--lang", default=None,
+                   help="Report language (any language name or code, e.g. "
+                        "pt, es, Japanese). The whole report is written in "
+                        "it; nothing is hardcoded.")
+    p.add_argument("--transcribe", action="store_true",
+                   help="Transcribe the audio with a dedicated speech-to-text "
+                        "model (any OpenAI-compatible /audio/transcriptions "
+                        "endpoint, e.g. whisper large-v3) and inject it as "
+                        "ground truth, taking the audio load off the vision "
+                        "model.")
+    p.add_argument("--stt-model", default=None,
+                   help="STT model name (or VIDEOLYZER_STT_MODEL; "
+                        "default: whisper-1)")
+    p.add_argument("--stt-backend", default="auto",
+                   choices=["auto", "whispero", "http"],
+                   help="Transcriber backend: auto (default) uses the "
+                        "installed whispero CLI when present and no HTTP "
+                        "STT endpoint is configured; whispero forces it; "
+                        "http forces the /audio/transcriptions endpoint")
+    p.add_argument("--stt-base-url", default=None,
+                   help="STT API base URL (or VIDEOLYZER_STT_BASE_URL; "
+                        "defaults to the primary base URL)")
+    p.add_argument("--stt-api-key", default=None,
+                   help="STT API key (or VIDEOLYZER_STT_API_KEY; defaults "
+                        "to the primary API key)")
     p.add_argument("--no-motion", action="store_true",
                    help="Skip the optical-flow subtle-motion pass")
     p.add_argument("--cut-threshold", type=float, default=0.4,
@@ -763,11 +1585,21 @@ def main() -> int:
                    help="Skip deterministic cut detection")
     p.add_argument("--keyframes", type=int, default=KEYFRAME_COUNT,
                    help="Keyframes for the openai provider / aux model (default: 8)")
+    p.add_argument("--no-cache", action="store_true",
+                   help="Skip the local measurement cache (cut detection, "
+                        "optical flow, per-shot timing are cached per video "
+                        "under ~/.cache/videolyzer)")
+    p.add_argument("--no-resume", action="store_true",
+                   help="Ignore any strips checkpoint and start all batches "
+                        "from scratch")
     args = p.parse_args()
+
+    global _NO_CACHE
+    _NO_CACHE = args.no_cache
 
     key = get_api_key(args)
     aux = get_aux_config(args)
-    prompt = args.prompt or ANALYZE_PROMPT
+    prompt = _with_lang(args.prompt or ANALYZE_PROMPT, args.lang)
     want_motion = not args.no_motion
     cut_threshold = None if args.no_cuts else args.cut_threshold
 
@@ -784,8 +1616,59 @@ def main() -> int:
         print("error: URL input is only supported with "
               "--provider gemini (without --fast)", file=sys.stderr)
         return 2
+    if args.strips and aux is None:
+        print("warn: --strips is set but no auxiliary model is configured; "
+              "strips only applies to the aux path (--fast or the fallback) "
+              "and will be ignored.", file=sys.stderr)
+
+    # Transcriber backend: auto -> local whispero when installed and no
+    # HTTP STT endpoint was explicitly configured, else the HTTP endpoint.
+    stt = None
+    stt_backend = None
+    if args.transcribe:
+        want = args.stt_backend
+        if want == "auto":
+            want = "http" if _stt_http_explicit(args) else (
+                "whispero" if _whispero_bin() else "http")
+        if want == "whispero" and not _whispero_bin():
+            print("error: --stt-backend whispero but no `whispero` CLI "
+                  "found on PATH.", file=sys.stderr)
+            return 2
+        stt_backend = want
+        if want == "http":
+            stt = get_stt_config(args)
 
     try:
+        transcript = None
+        if stt_backend and not is_url(args.source):
+            if not os.path.isfile(args.source):
+                print(f"error: file not found: {args.source}", file=sys.stderr)
+                return 2
+            if stt_backend == "whispero":
+                print("transcribing audio with local whispero...",
+                      file=sys.stderr)
+            else:
+                print("transcribing audio with dedicated STT model "
+                      f"'{stt['model'] if stt else '?'}'...",
+                      file=sys.stderr)
+            wav = extract_audio(args.source)
+            if wav:
+                try:
+                    if stt_backend == "whispero":
+                        transcript = transcribe_via_whispero(wav)
+                    elif stt is not None:
+                        transcript = transcribe_audio(stt, wav)
+                finally:
+                    try:
+                        os.unlink(wav)
+                    except OSError:
+                        pass
+            if transcript:
+                n = len(transcript.splitlines())
+                print(f"  transcript ok: {n} lines", file=sys.stderr)
+            else:
+                print("warn: transcription failed, continuing without it",
+                      file=sys.stderr)
         if args.fast:
             # Modo Rapido: everything on the aux model via keyframes.
             if aux is None:  # unreachable: validated above, narrows type
@@ -793,9 +1676,9 @@ def main() -> int:
             if not os.path.isfile(args.source):
                 print(f"error: file not found: {args.source}", file=sys.stderr)
                 return 2
-            report = analyze_aux_fast(aux, args.source, prompt,
-                                      want_motion, args.keyframes,
-                                      cut_threshold)
+            report = run_aux(aux, args, args.source, prompt,
+                                  want_motion, cut_threshold,
+                                  transcript=transcript)
         elif args.provider == "gemini":
             base = GEMINI_API_BASE
             if is_url(args.source):
@@ -814,14 +1697,15 @@ def main() -> int:
                       file=sys.stderr)
                 report = analyze_file_gemini(base, key, args.model,
                                              args.source, prompt, want_motion,
-                                             cut_threshold)
+                                             cut_threshold,
+                                             transcript=transcript)
                 if not report and aux:
                     # Fallback: aux model with keyframes.
                     print("warn: primary analysis failed, falling back to "
                           "auxiliary model...", file=sys.stderr)
-                    report = analyze_aux_fast(aux, args.source, prompt,
-                                              want_motion, args.keyframes,
-                                              cut_threshold)
+                    report = run_aux(aux, args, args.source, prompt,
+                                  want_motion, cut_threshold,
+                                  transcript=transcript)
         else:  # openai-compatible
             if not os.path.isfile(args.source):
                 print(f"error: file not found: {args.source}", file=sys.stderr)
@@ -831,13 +1715,14 @@ def main() -> int:
                   file=sys.stderr)
             report = analyze_file_openai(base, key, args.model, args.source,
                                          prompt, want_motion, args.keyframes,
-                                         cut_threshold)
+                                         cut_threshold,
+                                         transcript=transcript)
             if not report and aux:
                 print("warn: primary analysis failed, falling back to "
                       "auxiliary model...", file=sys.stderr)
-                report = analyze_aux_fast(aux, args.source, prompt,
-                                          want_motion, args.keyframes,
-                                          cut_threshold)
+                report = run_aux(aux, args, args.source, prompt,
+                                  want_motion, cut_threshold,
+                                  transcript=transcript)
     except Exception as exc:  # noqa: BLE001
         print(f"error: {exc}", file=sys.stderr)
         return 4
@@ -852,7 +1737,10 @@ def main() -> int:
             raise RuntimeError("aux model required for --verify")
         print("second opinion: aux model reviewing the report...",
               file=sys.stderr)
-        verdict = analyze_aux_verify(aux, args.source, report, args.keyframes)
+        verdict = analyze_aux_verify(aux, args.source, report, args.keyframes,
+                                      args.strips, args.strip_frames,
+                                      args.max_strips, cut_threshold,
+                                      lang=args.lang)
         if verdict:
             report = report.rstrip() + "\n\n" + verdict + "\n"
         else:

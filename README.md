@@ -7,7 +7,7 @@ A single CLI that turns a video (YouTube URL or local file) into a structured Ma
 ## Quick start
 
 ```bash
-pip install -r requirements.txt   # opencv + numpy (only needed for the subtle-motion pass)
+pip install videolyzer
 
 export VIDEOLYZER_API_KEY="your-key"
 
@@ -66,9 +66,11 @@ The auxiliary model is a second, independent multimodal model — any OpenAI-com
 
 | Role | How |
 |---|---|
-| **Second opinion** (`--verify`) | After the primary analysis, the aux model reviews the report against keyframes: agrees/disagrees per scene, flags temporal-order mistakes. Appended as a "Second opinion" section. |
+| **Second opinion** (`--verify`) | After the primary analysis, the aux model reviews the report (against frame strips when `--strips` is on, keyframes otherwise): agrees/disagrees per scene, flags temporal-order mistakes. Appended as a "Second opinion" section. |
 | **Temporal verifier** | Built into every aux pass: the prompt forces motion verbs and event-order checks across keyframes. |
-| **Fallback** | If the primary analysis fails and an aux model is configured, Videolyzer automatically retries with the aux model on keyframes. |
+| **Fallback** | If the primary analysis fails and an aux model is configured, Videolyzer automatically retries with the aux model on keyframes (or on per-shot frame strips with `--strips`). |
+
+**Dedicated transcriber** (`--transcribe`) offloads the audio: the transcript goes into the prompt as ground truth, so the vision model spends its budget on what it sees. Two backends (`--stt-backend`): `whispero` uses the locally installed [whispero](https://pypi.org/project/whispero/) CLI (local faster-whisper; timestamps and speaker tags preserved); `http` uses any OpenAI-compatible `/audio/transcriptions` endpoint (e.g. whisper large-v3). With `auto` (default), whispero is picked when installed and no HTTP STT endpoint is configured. HTTP config via `--stt-model` / `--stt-base-url` / `--stt-api-key` (or `VIDEOLYZER_STT_*` env vars); base URL and key fall back to the primary provider's. The two tools stay separate packages — this is integration, not a merger.
 
 **Modo Rapido** (`--fast`) skips the full video upload entirely and runs the whole analysis on the auxiliary model with evenly spaced keyframes (+ the optical-flow subtle-motion hints). Much faster and cheaper than the native path — best when only "what appears" matters and fine motion detail is not critical. Requires the aux model to be configured.
 
@@ -102,6 +104,9 @@ videolyzer.py <source> [--provider gemini|openai] [--model NAME]
     [--fast] [--verify]
     [--out report.md] [--prompt "..."] [--no-motion] [--no-cuts]
     [--cut-threshold 0.4] [--keyframes 8]
+    [--strips] [--strip-frames 8] [--max-strips 24]
+    [--lang LANG] [--transcribe] [--stt-model NAME]
+    [--no-cache] [--no-resume]
 ```
 
 | Flag | Default | Description |
@@ -122,6 +127,18 @@ videolyzer.py <source> [--provider gemini|openai] [--model NAME]
 | `--cut-threshold` | 0.4 | Scene-detection threshold for deterministic cut detection. Lower = more sensitive |
 | `--no-cuts` | off | Skip deterministic cut detection |
 | `--keyframes` | 8 | Keyframes for the openai provider / aux model |
+| `--strips` | off | Aux model (`--fast` and the fallback) gets one image per shot (top row spread across the shot, bottom row consecutive frames) plus locally measured cadence (ones/twos/threes), holds and camera speed. Built for animation review; also `VIDEOLYZER_STRIPS=1`. Warns when set without an aux model |
+| `--strip-frames` | 8 | Frames per strip row |
+| `--max-strips` | 24 | Max shots sent as strips (evenly sampled, batched 6 per request, then merged) |
+| `--verify` | off | Second opinion: aux model cross-checks the primary report (uses frame strips when `--strips` is on, keyframes otherwise). Requires `--aux-model` |
+| `--lang` | — | Report language, any language name or code (`pt`, `es`, `Japanese`...). Nothing hardcoded |
+| `--transcribe` | off | Transcribe audio with a dedicated transcriber and inject it as transcript ground truth, taking the audio load off the vision model |
+| `--stt-backend` | `auto` | `auto`: local `whispero` CLI when installed and no HTTP STT endpoint is configured, else HTTP. `whispero`: force the local CLI (local faster-whisper, timestamps + speaker tags via SRT). `http`: force the `/audio/transcriptions` endpoint |
+| `--stt-model` | `whisper-1` | STT model name, HTTP backend (or `VIDEOLYZER_STT_MODEL`) |
+| `--stt-base-url` | primary | STT endpoint base URL (or `VIDEOLYZER_STT_BASE_URL`; falls back to the primary base URL) |
+| `--stt-api-key` | primary | STT API key (or `VIDEOLYZER_STT_API_KEY`; falls back to the primary API key) |
+| `--no-cache` | off | Skip the local measurement cache (cuts, optical flow, per-shot timing are cached per video under `~/.cache/videolyzer`, or `$VIDEOLYZER_CACHE_DIR`) |
+| `--no-resume` | off | Ignore any strips checkpoint and run all batches from scratch (checkpoints live in the cache dir and are deleted after a successful merge) |
 
 ## Requirements
 
