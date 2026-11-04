@@ -21,3 +21,7 @@ Thumbs.db
 *.avi
 *-report.md
 .env
+
+# Test / tool caches
+.pytest_cache/
+.ruff_cache/

@@ -29,6 +29,22 @@ jobs:
           fi
           echo "version OK: $VERSION"
 
+      - name: Check __version__ matches pyproject
+        run: |
+          VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+          MODVER=$(grep -m1 '^__version__' videolyzer.py | sed 's/.*"\(.*\)"/\1/')
+          if [ "$VERSION" != "$MODVER" ]; then
+            echo "error: videolyzer.__version__ $MODVER != pyproject $VERSION"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg libgl1
+          pip install -e ".[dev]"
+          ruff check .
+          python -m pytest -q
+
       - name: Build package
         run: |
           pip install build twine
