@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0
 
 Audit release: security, correctness, a working Whispero integration, an
 offline mode, better "vision" for the models and a machine-readable
